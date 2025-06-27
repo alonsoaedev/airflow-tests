@@ -1,0 +1,131 @@
+from datetime import datetime
+from typing import Callable, Self
+
+from pydantic import BaseModel, computed_field
+
+class AccountingLine(BaseModel):
+    poco: str | None = None
+    poodct: str | None = None
+    pojeln: int | None = None
+    postdo: str | None = None
+    podgj: datetime | None = None
+    posicc: str | None = None
+    pomcu: str | None = None
+    poctao: str | None = None
+    poani: str | None = None
+    poaid: str | None = None
+    poaa: int | None = None
+    poexa: str | None = None
+    pocrcd: str | None = None
+    pocrr: int | None = None
+    poosbl: str | None = None
+    posbl: str | None = None
+    pocprov: str | None = None
+    poan8: int | None = None
+    podoc: int | None = None
+    podct: str | None = None
+    poicu: int | None = None
+    pouser: str | None = None
+    popid: str | None = None
+    pojobn: str | None = None
+    poupmj: datetime | None = None
+    poupmt: str | None = None
+    povinv: str | None = None
+    mensaje: str | None = None
+    ic_estado: str | None = None
+
+class AccountingEntry(BaseModel):
+    ponuin: int
+    poodoc: int
+    accounting_lines: list[AccountingLine] | None = []
+
+    @computed_field
+    @property
+    def next_pojeln(self) -> int:
+        return len(self.accounting_lines) + 1
+
+    def add_accounting_line(self, accounting_line: AccountingLine) -> None:
+        self.accounting_lines.append(accounting_line)
+
+    def modify_one_accounting_line(self, accounting_line_number: int, map_function: Callable[[AccountingLine], AccountingLine]) -> Self:
+        if accounting_line_number - 1 >= len(self.accounting_lines):
+            return self
+
+        self.accounting_lines[accounting_line_number - 1] = map_function(self.accounting_lines[accounting_line_number - 1])
+        return self
+
+    def modify_all_accounting_lines(self, map_function: Callable[[AccountingLine], AccountingLine]) -> Self:
+        self.accounting_lines = [map_function(line) for line in self.accounting_lines]
+        return self
+
+
+accounting_entry_1 = AccountingEntry(
+    ponuin=1,
+    poodoc=1,
+    accounting_lines=[
+        AccountingLine(
+            podgj=datetime.now(),
+            posicc="test value",
+            poaa=0,
+            poupmj=datetime.now(),
+            poupmt="test value",
+            # pomcu=posicc,
+            # poaid=calulate_poaid,
+            # povinv=calculate_povinv,
+
+            poco="A771",
+            poodct="SH",
+            pojeln=1,
+            postdo="CG",
+            poctao=None,
+            poani="7041200022",
+            poexa="INGRESOS SERVICIO DE DESPACHO A DOMICILIO",
+            pocrcd="PEN",
+            pocrr=0,
+            poosbl=None,
+            posbl=None,
+            pocprov=None,
+            poan8=None,
+            podoc=None,
+            podct=None,
+            poicu=None,
+            pouser="BBR",
+            popid="20603150954",
+            pojobn="10.20.29.9",
+            mensaje="",
+            ic_estado="P",
+        ),
+        AccountingLine(
+            podgj=datetime.now(),
+            posicc="test value",
+            poaa=0,
+            poupmj=datetime.now(),
+            poupmt="test value",
+            # pomcu=posicc,
+            # poaid=calulate_poaid,
+            # povinv=calculate_povinv,
+
+            poco="A771",
+            poodct="SH",
+            pojeln=1,
+            postdo="CG",
+            poctao=None,
+            poani="7041200022",
+            poexa="INGRESOS SERVICIO DE DESPACHO A DOMICILIO",
+            pocrcd="PEN",
+            pocrr=0,
+            poosbl=None,
+            posbl=None,
+            pocprov=None,
+            poan8=None,
+            podoc=None,
+            podct=None,
+            poicu=None,
+            pouser="BBR",
+            popid="20603150954",
+            pojobn="10.20.29.9",
+            mensaje="",
+            ic_estado="P",
+        ),
+    ],
+)

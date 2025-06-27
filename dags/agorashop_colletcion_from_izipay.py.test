@@ -1,0 +1,689 @@
+from datetime import timedelta, datetime, UTC
+import pandas as pd
+import numpy as np
+import os
+
+from airflow import DAG
+from airflow.models.dagrun import DagRun
+from airflow.models.taskinstance import TaskInstance
+from airflow.operators.python_operator import PythonOperator
+from airflow.providers.google.cloud.hooks.cloud_sql import CloudSQLDatabaseHook
+from airflow.utils.dates import days_ago
+
+interval = {
+    'dev': None,
+    'qa': None,
+    'prod': None
+}
+
+emails = {
+    'dev': ['tesoreria.bbr@gmail.com'],
+    'qa': ['tesoreria.bbr@gmail.com'],
+    'prod': ['tesoreria.bbr@gmail.com']
+}
+
+db_destination = {
+    "dev": {
+        "ctx_proxy": "agorashop_gcp_proxy_qa",
+        "cyle_proxy": "ctecom_gcp_proxy_qa",
+        "proxy_key": "gcp_proxy_key_qa",
+    },
+    "qa": {
+        "ctx_proxy": "agorashop_gcp_proxy_qa",
+        "cyle_proxy": "ctecom_gcp_proxy_qa",
+        "proxy_key": "gcp_proxy_key_qa",
+    },
+    "prod": {
+        "ctx_proxy": "agorashop_gcp_proxy",
+        "cyle_proxy": "ctecom_gcp_proxy",
+        "proxy_key": "gcp_proxy_key",
+    }
+}
+
+def on_failure_callback(context):
+    print("FAILURE CALLBACK")
+
+with DAG(
+    "agorashop_collection_from_izipay",
+    catchup=False,
+    schedule_interval=interval[os.environ['BBR_ENVIRONMENT']],
+    max_active_runs=1,
+    user_defined_macros={
+        "BBR_ENVIRONMENT": os.environ["BBR_ENVIRONMENT"].upper()
+    },
+    default_args={
+        'owner': 'admin',
+        'depends_on_past': False,
+        'start_date': days_ago(0),
+        'email': emails[os.environ['BBR_ENVIRONMENT']],
+        'email_on_failure': True,
+        'email_on_retry': True,
+        'retries': 0,
+        'retry_delay': timedelta(minutes=2)
+    },
+) as dag:
+    from accounting_entry import AccountingEntry, AccountingLine
+
+    def fetch_data(dag_run: DagRun, ti: TaskInstance):
+        print(f"DAG conf: {dag_run.conf}")
+        date = dag_run.conf["date"]
+        ponuin = dag_run.conf["ponuin"]
+        orders_numbers: list[str] = dag_run.conf.get("orders_numbers", [])
+        orders_numbers: list[str] = list(map(wrap_order_number_single_quotes, orders_numbers))
+        orders_numbers_filter = f"AND cht.HED_NUMTRX IN ({", ".join(orders_numbers)})" if orders_numbers else ""
+        
+        previous_date = dag_run.conf["previous_date"]
+        poodoc = get_max_poodoc(ponuin='C' + str(ponuin).zfill(5), podgj=previous_date)
+        
+        print(f"POODOC: {poodoc}")
+
+        cloud_psql = CloudSQLDatabaseHook(
+            gcp_cloudsql_conn_id=db_destination[os.environ["BBR_ENVIRONMENT"]]["ctx_proxy"], 
+            gcp_conn_id=db_destination[os.environ["BBR_ENVIRONMENT"]]["proxy_key"])
+        conn = cloud_psql.create_connection()
+        proxy_instance = cloud_psql.get_sqlproxy_runner()
+        proxy_instance.start_proxy()
+        pg_hook = cloud_psql.get_database_hook(conn)
+        connection = pg_hook.get_conn()
+        cursor = connection.cursor()
+        
+        requests = [
+        f"""
+            SELECT 
+                ctx.PAG_FCONTABLE AS PODGJ , 
+                il.loc_centrocosto AS POSICC , 
+                SUM(ctx.PAG_MONTO + ctx.PAG_RECARGO_3 + ctx.PAG_RECARGO_4) AS POAA , 
+                lower(ctx.PAG_FONOCLI) AS POEXA , 
+                ctx.HED_LOCAL AS POUPMT , 
+                current_date AS POUPMJ 
+                
+            FROM ctagorashop.CTX_PAGOS_TRX ctx
+            JOIN ctagorashop.ctx_header_trx cht ON ctx.hed_pais = cht.hed_pais AND ctx.hed_origentrx = cht.hed_origentrx AND ctx.hed_local = cht.hed_local AND ctx.hed_pos = cht.hed_pos AND ctx.hed_numtrx = cht.hed_numtrx AND ctx.hed_fechatrx = cht.hed_fechatrx AND ctx.hed_horatrx = cht.hed_horatrx
+            JOIN ctagorashop.irs_locales il ON il.loc_numero::integer = ctx.HED_LOCAL
+            
+            WHERE 1 = 1
+            AND DATE(ctx.HED_FECHATRX) = '{datetime.utcfromtimestamp(date).strftime('%Y-%m-%d')}'
+            {orders_numbers_filter}
+            GROUP BY POSICC, PODGJ, POUPMT, POEXA;
+        """,
+        f"""
+            SELECT 
+                ctx.PAG_FCONTABLE AS PODGJ , 
+                il.loc_centrocosto AS POSICC , 
+                SUM(ctx.PAG_MONTO + ctx.PAG_RECARGO_3 + ctx.PAG_RECARGO_4) AS POAA , 
+                
+                ctx.HED_LOCAL AS POUPMT , 
+                current_date AS POUPMJ 
+                
+            FROM ctagorashop.CTX_PAGOS_TRX ctx
+            JOIN ctagorashop.ctx_header_trx cht ON ctx.hed_pais = cht.hed_pais AND ctx.hed_origentrx = cht.hed_origentrx AND ctx.hed_local = cht.hed_local AND ctx.hed_pos = cht.hed_pos AND ctx.hed_numtrx = cht.hed_numtrx AND ctx.hed_fechatrx = cht.hed_fechatrx AND ctx.hed_horatrx = cht.hed_horatrx
+            JOIN ctagorashop.irs_locales il ON il.loc_numero::integer = ctx.HED_LOCAL
+            
+            WHERE 1 = 1
+            AND DATE(ctx.HED_FECHATRX) = '{datetime.utcfromtimestamp(date).strftime('%Y-%m-%d')}'
+            {orders_numbers_filter}
+            GROUP BY POSICC, PODGJ, POUPMT;
+        """,
+        ]
+
+
+        accounting_entry = AccountingEntry(
+            ponuin=ponuin,
+            poodoc=poodoc,
+        )
+        for request in requests:
+            print(request)
+            cursor.execute(request)
+            records = cursor.fetchall()
+
+            for record in records:
+                accounting_entry.add_accounting_line(
+                    AccountingLine(
+                        podgj=record[0],
+                        posicc=record[1],
+                        poaa=record[2],
+                        poexa=record[3],
+                        poupmt=record[4],
+                        poupmj=record[5],
+                        pojeln=accounting_entry.next_pojeln,
+                        poco="A771",
+                        poodct="SH",
+                        pojeln=1,
+                        postdo="CG",
+                        poctao=None,
+                        pocrcd="PEN",
+                        pocrr=0,
+                        poosbl=None,
+                        posbl=None,
+                        pocprov=None,
+                        poan8=None,
+                        podoc=None,
+                        podct=None,
+                        poicu=None,
+                        pouser="BBR",
+                        pojobn="10.20.29.9",
+                        mensaje="",
+                        ic_estado="P"
+                    )
+                )
+        
+        proxy_instance.stop_proxy()
+        ti.xcom_push(key='poodoc', value=poodoc)
+        return accounting_entry.model_dump_json()
+
+def transform(ti: TaskInstance):
+    accounting_entry = AccountingEntry.model_validate_json(ti.xcom_pull(task_ids=["fetch_data"]))
+    accounting_entry\
+        .modify_all_accounting_lines(use_posicc_in_pomcu)\
+        .modify_one_accounting_line(1, use_04_or_14_poaid)\
+        .modify_one_accounting_line(1, change_acc_entry_1_line_1_popid)\
+        .modify_one_accounting_line(1, change_acc_entry_1_line_1_poani)\
+        .modify_one_accounting_line(1, change_acc_entry_1_line_1_poexa)\
+        .modify_one_accounting_line(2, use_50_or_40_in_poaid)\
+        .modify_one_accounting_line(2, change_acc_entry_1_line_2_popid)\
+        .modify_one_accounting_line(2, change_acc_entry_1_line_2_poani)\
+        .modify_one_accounting_line(2, change_acc_entry_1_line_2_poexa)\
+        .modify_all_accounting_lines(calculate_povinv)
+    
+    return accounting_entry.model_dump_json()
+
+def sql_generator(ti):
+    accounting_entry = AccountingEntry.model_validate_json(ti.xcom_pull(task_ids=["transform"]))
+
+    inter_contable_sql = "BEGIN TRANSACTION;"
+    for df in dfs:
+        if len(df) == 0:
+            return ""
+        inter_contable_sql += generate_sql_to_insert_accounting_seats(df=df)
+        
+
+    inter_contable_sql += "COMMIT TRANSACTION;"
+    
+
+    return inter_contable_sql
+
+def apply_sql(ti, **kwargs):
+    dag_conf = kwargs["dag_run"].conf
+    sql = ti.xcom_pull(task_ids=['sql_generator'])[0]
+    date = dag_conf["date"] if "date" in dag_conf else None
+    ponuin = dag_conf["ponuin"] if "ponuin" in dag_conf else None
+
+    cloud_psql = CloudSQLDatabaseHook(
+        gcp_cloudsql_conn_id=db_destination[os.environ["BBR_ENVIRONMENT"]]["ctx_proxy"], 
+        gcp_conn_id=db_destination[os.environ["BBR_ENVIRONMENT"]]["proxy_key"])
+    conn = cloud_psql.create_connection()
+    proxy_instance = cloud_psql.get_sqlproxy_runner()
+    proxy_instance.start_proxy()
+    pg_hook = cloud_psql.get_database_hook(conn)
+    connection = pg_hook.get_conn()
+    cursor = connection.cursor()
+
+    if sql:
+        print(f"date: {date}")
+        print(f"ponuin: {ponuin}")
+        print(f"INTER_CONTABLE: {sql}")
+        cursor.execute(sql)
+    else:
+        print("There were no records")
+
+    proxy_instance.stop_proxy()
+    return sql
+
+
+
+def validate_balancing(dag_run):
+    ponuin_number = dag_run.conf["ponuin"]
+    ponuin_code = "C" + str(ponuin_number).zfill(5)
+    
+    cloud_psql = CloudSQLDatabaseHook(
+        gcp_cloudsql_conn_id=db_destination[os.environ["BBR_ENVIRONMENT"]]["ctx_proxy"], 
+        gcp_conn_id=db_destination[os.environ["BBR_ENVIRONMENT"]]["proxy_key"])
+    conn = cloud_psql.create_connection()
+    proxy_instance = cloud_psql.get_sqlproxy_runner()
+    proxy_instance.start_proxy()
+    pg_hook = cloud_psql.get_database_hook(conn)
+    
+    connection = pg_hook.get_conn()
+    cursor = connection.cursor()
+    print("*********************************************")
+    print("VALIDATE BALANCING")
+    # La consulta obtiene los calcula los totales agrupados por el campo <ponuin>, se calcula la diferencia y si es 0 regresa <OK>
+    request = f"""
+        SELECT ponuin,
+            case
+                when SUM(sum)=0 then 'OK'
+                else 'ERROR'
+            end AS status
+        FROM (
+            (SELECT ponuin, poodoc, ABS(SUM(sum)) * -1 AS SUM FROM(
+                SELECT ponuin, poodoc, poaid, 
+                    case 
+                        when poaid::int=21 then SUM(poaa) 
+                        when poaid::int=31 then SUM(poaa) * -1 
+                    end AS sum
+                FROM ctagorashop.IFC_INTER_CONTABLE
+                WHERE 1=1
+                AND poaid::int < 35
+                AND ponuin = '{ponuin_code}'
+                GROUP BY ponuin, poodoc, poaid
+                ORDER BY ponuin, poodoc, poaid
+            ) AS t1
+            GROUP BY ponuin, poodoc)
+            UNION ALL
+            (SELECT ponuin, poodoc, ABS(SUM(sum)) AS sum FROM(
+                SELECT ponuin, poodoc, poaid, 
+                    case 
+                        when poaid::int=40 then SUM(poaa) 
+                        when poaid::int=50 then SUM(poaa) * -1 
+                    end AS sum
+                FROM ctagorashop.IFC_INTER_CONTABLE
+                WHERE 1=1
+                AND poaid::int > 35
+                AND ponuin = '{ponuin_code}'
+                GROUP BY ponuin, poodoc, poaid
+                ORDER BY ponuin, poodoc, poaid
+            ) AS t2
+            GROUP BY ponuin, poodoc)
+        ) AS accounting
+        GROUP BY ponuin;
+    """
+    print(request)
+    cursor.execute(request)
+    source = cursor.fetchall()
+    print(source)
+    df = pd.DataFrame(source, columns=['ponuin', 'status'])
+    for index, row in df.iterrows():
+        row_status = df.loc[index, 'status']
+        row_ponuin = df.loc[index, 'ponuin']
+        if row_status != 'OK':
+            print(f"PONUIN <{row_ponuin}>, VALUES ARE NOT EQUAL; ERROR")
+        else:
+            print(f"PONUIN <{row_ponuin}>, EQUAL")
+    cursor.execute(request)
+    proxy_instance.stop_proxy()
+
+def trigger_next_accounting_seat(dag_run: DagRun, ti: TaskInstance):
+    ponuin = dag_run.conf.get('ponuin')
+    date = dag_run.conf.get('date')
+    orders_numbers: list[str] = dag_run.conf.get("orders_numbers", [])
+    poodoc = int(ti.xcom_pull(key='poodoc')) + 1
+    from airflow.api.client.local_client import Client
+    c = Client(None, None)
+    c.trigger_dag(
+        dag_id='agorashop_ifc_asiento2',
+        conf={
+            'ponuin': ponuin,
+            'date': date,
+            'poodoc':  poodoc,
+            'orders_numbers': orders_numbers,
+            
+        }
+    )
+
+def use_posicc_in_pomcu(line: AccountingLine) -> AccountingLine:
+    line.pomcu = line.posicc
+    return line
+
+def use_04_or_14_poaid(line: AccountingLine):
+    line.poaid = "04" if line.poaa > 0 else "14"
+    return line
+
+def use_50_or_40_in_poaid(line: AccountingLine):
+    line.poaid = "50" if line.poaa > 0 else "40"
+    return line
+
+def use_40_or_50_in_poaid(line: AccountingLine):
+    line.poaid = "40" if line.poaa > 0 else "50"
+    return line
+
+def change_acc_entry_1_line_1_popid(line: AccountingLine):
+    rucs = {
+        "AMEX": 2046773730,
+        "MASTERCARD": 2043240552,
+        "VISA":2043240552,
+        "DINERS":2010011876,
+        "american express": 2046773730,
+        "amex": 2046773730,
+        "mastercard": 2043240552,
+        "visa":2043240552,
+        "diners":2010011876
+    }
+    line.popid = rucs[line.poexa.lower()]
+    return line
+
+def change_acc_entry_1_line_1_poani(line: AccountingLine):
+    poanis = {
+        "visa": 1213030001,
+        "mastercard": 1213030001,
+        "amex": 1213030003,
+        "diners": 1213030004
+    }
+    line.poani = poanis[line.poexa.lower()]
+    return line
+
+def change_acc_entry_1_line_1_poexa(line: AccountingLine):
+    line.poexa = 'FAC X COBRAR IZIPAY ' + line.poexa.title()
+    return line
+
+def change_acc_entry_1_line_2_popid(line: AccountingLine):
+    line.popid = "20212021"
+    return line
+
+def change_acc_entry_1_line_2_poani(line: AccountingLine):
+    line.poani = "1011010000"
+    return line
+
+def change_acc_entry_1_line_2_poexa(line: AccountingLine):
+    line.poexa = 'AGORA SHOP'
+    return line
+
+def calculate_povinv(line: AccountingLine):
+    line.povinv = f"{line.popid} {line.pomcu if line.pomcu else ''}"
+    return line
+
+def make_poaa_absolute(line: AccountingLine):
+    line.poaa = abs(line.poaa)
+    return line
+
+def convert_data_types(*, df: pd.DataFrame) -> pd.DataFrame:
+    print("Apply data types functions")
+    df = df.replace({np.nan: 'None'})
+    df['PONUIN'] = to_string(df, 'PONUIN')
+    df['POCO'] = to_string(df, 'POCO')
+    df['POODCT'] = to_string(df, 'POODCT')
+    df['POSTDO'] = to_string(df, 'POSTDO')
+    df['PODGJ'] = to_date(df, 'PODGJ')
+    df['POSICC'] = to_string(df, 'POSICC')
+    df['POMCU'] = to_string(df, 'POMCU')
+    df['POCTAO'] = to_string(df, 'POCTAO')
+    df['POANI'] = to_string(df, 'POANI')
+    df['POAID'] = to_string(df, 'POAID')
+    df['POEXA'] = to_string(df, 'POEXA')
+    df['POCRCD'] = to_string(df, 'POCRCD')
+    df['POOSBL'] = to_string(df, 'POOSBL')
+    df['POSBL'] = to_string(df, 'POSBL')
+    df['POCPROV'] = to_string(df, 'POCPROV')
+    df['PODCT'] = to_string(df, 'PODCT')
+    df['POUSER'] = to_string(df, 'POUSER')
+    df['POPID'] = to_string(df, 'POPID')
+    df['POJOBN'] = to_string(df, 'POJOBN')
+    df['POUPMJ'] = to_date(df, 'POUPMJ')
+    df['POUPMT'] = to_string(df, 'POUPMT')
+    df['POVINV'] = to_string(df, 'POVINV')
+    df['MENSAJE'] = to_string(df, 'MENSAJE')
+    df['IC_ESTADO'] = to_string(df, 'IC_ESTADO')
+    return df
+
+def adjust_pojeln(*, df: pd.DataFrame, start_index: int) -> pd.DataFrame:
+    for index, _ in df.iterrows():
+        df.loc[index, 'POJELN'] = start_index
+        start_index += 1
+    return df
+
+def generate_sql_to_insert_accounting_seats(*, df: pd.DataFrame) -> str:
+    sql = ""
+    for _, row in df.iterrows():
+        sql += f"""
+            INSERT INTO ctagorashop.IFC_INTER_CONTABLE (
+                PONUIN,
+                POCO,
+                POODOC,
+                POODCT,
+                POJELN,
+                POSTDO,
+                PODGJ,
+                POSICC,
+                POMCU,
+                POCTAO,
+                POANI,
+                POAID,
+                POAA,
+                POEXA,
+                POCRCD,
+                POCRR,
+                POOSBL,
+                POSBL,
+                POCPROV,
+                POAN8,
+                PODOC,
+                PODCT,
+                POICU,
+                POUSER,
+                POPID,
+                POJOBN,
+                POUPMJ,
+                POUPMT,
+                POVINV,
+                MENSAJE,
+                IC_ESTADO
+                
+            )
+            VALUES (
+                {'NULL' if row['PONUIN'] == 'None' or row['PONUIN'] == None else row['PONUIN']},
+                {'NULL' if row['POCO'] == 'None' or row['POCO'] == None else row['POCO']},
+                {'NULL' if row['POODOC'] == 'None' or row['POODOC'] == None else row['POODOC']},
+                {'NULL' if row['POODCT'] == 'None' or row['POODCT'] == None else row['POODCT']},
+                {'NULL' if row['POJELN'] == 'None' or row['POJELN'] == None else row['POJELN']},
+                {'NULL' if row['POSTDO'] == 'None' or row['POSTDO'] == None else row['POSTDO']},
+                {'NULL' if row['PODGJ'] == 'None' or row['PODGJ'] == None else row['PODGJ']},
+                {'NULL' if row['POSICC'] == 'None' or row['POSICC'] == None else row['POSICC']},
+                {'NULL' if row['POMCU'] == 'None' or row['POMCU'] == None else row['POMCU']},
+                {'NULL' if row['POCTAO'] == 'None' or row['POCTAO'] == None else row['POCTAO']},
+                {'NULL' if row['POANI'] == 'None' or row['POANI'] == None else row['POANI']},
+                {'NULL' if row['POAID'] == 'None' or row['POAID'] == None else row['POAID']},
+                {'NULL' if row['POAA'] == 'None' or row['POAA'] == None else row['POAA']},
+                {'NULL' if row['POEXA'] == 'None' or row['POEXA'] == None else row['POEXA']},
+                {'NULL' if row['POCRCD'] == 'None' or row['POCRCD'] == None else row['POCRCD']},
+                {'NULL' if row['POCRR'] == 'None' or row['POCRR'] == None else row['POCRR']},
+                {'NULL' if row['POOSBL'] == 'None' or row['POOSBL'] == None else row['POOSBL']},
+                {'NULL' if row['POSBL'] == 'None' or row['POSBL'] == None else row['POSBL']},
+                {'NULL' if row['POCPROV'] == 'None' or row['POCPROV'] == None else row['POCPROV']},
+                {'NULL' if row['POAN8'] == 'None' or row['POAN8'] == None else row['POAN8']},
+                {'NULL' if row['PODOC'] == 'None' or row['PODOC'] == None else row['PODOC']},
+                {'NULL' if row['PODCT'] == 'None' or row['PODCT'] == None else row['PODCT']},
+                {'NULL' if row['POICU'] == 'None' or row['POICU'] == None else row['POICU']},
+                {'NULL' if row['POUSER'] == 'None' or row['POUSER'] == None else row['POUSER']},
+                {'NULL' if row['POPID'] == 'None' or row['POPID'] == None else row['POPID']},
+                {'NULL' if row['POJOBN'] == 'None' or row['POJOBN'] == None else row['POJOBN']},
+                {'NULL' if row['POUPMJ'] == 'None' or row['POUPMJ'] == None else row['POUPMJ']},
+                {'NULL' if row['POUPMT'] == 'None' or row['POUPMT'] == None else row['POUPMT']},
+                {'NULL' if row['POVINV'] == 'None' or row['POVINV'] == None else row['POVINV']},
+                {'NULL' if row['MENSAJE'] == 'None' or row['MENSAJE'] == None else row['MENSAJE']},
+                {'NULL' if row['IC_ESTADO'] == 'None' or row['IC_ESTADO'] == None else row['IC_ESTADO']}
+                
+            );
+        """
+    return sql
+
+def get_max_poodoc(ponuin: str, podgj: int) -> int:
+    if not podgj:
+        return 1
+
+    poodoc = 1
+    podgj_str_date = datetime.fromtimestamp(podgj, UTC).strftime('%Y-%m-%d')
+    query = f"""
+        SELECT MAX(poodoc) FROM ctagorashop.ifc_inter_contable WHERE ponuin >= '{ponuin}' AND podgj = '{podgj_str_date}';
+    """
+    cloud_psql = CloudSQLDatabaseHook(
+        gcp_cloudsql_conn_id=db_destination[os.environ["BBR_ENVIRONMENT"]]["ctx_proxy"], 
+        gcp_conn_id=db_destination[os.environ["BBR_ENVIRONMENT"]]["proxy_key"])
+    conn = cloud_psql.create_connection()
+    proxy_instance = cloud_psql.get_sqlproxy_runner()
+    proxy_instance.start_proxy()
+    pg_hook = cloud_psql.get_database_hook(conn)
+    connection = pg_hook.get_conn()
+    cursor = connection.cursor()
+    cursor.execute(query)
+    sources = cursor.fetchall()
+
+    print(sources)
+    if sources[0][0]:
+        poodoc = int(sources[0][0])
+    else:
+        query = f"""
+            SELECT MAX(poodoc) FROM ctagorashop.ifc_inter_contable WHERE ponuin >= '{ponuin}';
+        """
+        cursor.execute(query)
+        sources = cursor.fetchall()
+        poodoc = int(sources[0][0]) if sources[0][0] else 1
+    proxy_instance.stop_proxy()
+    return poodoc + 1
+
+def wrap_order_number_single_quotes(order_number: str) -> str:
+    return f"'{order_number}'"
+
+def get_posicc(df):
+    return df['POSICC']
+
+def make_poaa_absolute(df):
+    df['POAA'] = abs(df['POAA'])
+    return df['POAA']
+
+def asiento4_calculate_poexa_1(df):
+    df['POEXA'] = 'FAC X COBRAR ' + df['POEXA'].astype(str)
+    return df['POEXA']
+
+def asiento4_calculate_poexa_2(df):
+    df['POEXA'] = 'COMISIONES DIVERSAS'
+    return df['POEXA']    
+
+def calculate_povinv(df):
+    df['POVINV'] = df['POPID'].astype(str) + np.where(df['POMCU'].isnull(), '', df['POMCU'].astype(str))
+    return df['POVINV']
+
+def asiento4_calculate_popid_1(df):
+    ruc = {
+        "INKAFARMA": 2033106670,
+        "PRO": 2010007097,
+        "SPSA": 2010007097,
+        "OE": 2010007097,
+    }
+    df['POPID'] = df['POEXA']
+    for index, row in df.iterrows():
+        df['POPID'][index] = ruc[df['POEXA'][index]]
+    return df['POPID']
+
+def asiento4_calculate_popid_2(df):
+    df['POPID'] = '20212021'
+    return df['POPID']
+
+def get_50_or_40_poaid(df: pd.DataFrame):
+    df['POAID'] = np.where(df['POAA'] > 0, 50, 40)
+    return df['POAID']
+
+def get_31_or_21_poaid(df: pd.DataFrame):
+    df['POAID'] = np.where(df['POAA'] > 0, 31, 21)
+    return df['POAID']
+
+def get_40_or_50_poaid(df: pd.DataFrame):
+    df['POAID'] = np.where(df['POAA'] > 0, 40, 50)
+    return df['POAID']
+
+def asiento1_calculate_poaid_1(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 40, 50)
+    return df['POAID']
+
+def asiento1_calculate_poaid_2(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 31, 21)
+    return df['POAID']
+
+def asiento2_calculate_poaid_1(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 50, 40)
+    return df['POAID']
+
+def asiento2_calculate_poaid_2(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 50, 40)
+    return df['POAID']
+
+def asiento3_calculate_poaid_3(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 40, 50)
+    return df['POAID']
+
+def asiento2_calculate_poaid_3(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 21, 31)
+    return df['POAID']
+
+def asiento4_calculate_poaid_1(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 40, 50)
+    return df['POAID']
+
+def asiento4_calculate_poaid_2(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 50, 40)
+    return df['POAID']
+
+def asiento7_calculate_poaid_1_2(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 40, 50)
+    return df['POAID']
+
+def asiento1_calculate_poaid_3(df):
+    df['POAID'] = np.where(df['POAA'] > 0, 50, 40)
+    return df['POAID']
+
+def to_date(df, serie):
+    df[serie] = pd.to_datetime(df[serie], unit='ms').dt.date
+    df[serie] = "'" + df[serie].astype(str) + "'"
+    return df[serie]
+
+def to_string(df,serie):
+    df[serie] = np.where(df[serie] == "None", 'NULL', "'" + df[serie].astype(str) + "'")
+    return df[serie]
+
+fetch_data = PythonOperator(
+    task_id='fetch_data',
+    provide_context=True,
+    python_callable=fetch_data,
+    on_failure_callback=on_failure_callback,
+    dag=dag
+)
+
+fixed = PythonOperator(
+    task_id='fixed',
+    provide_context=True,
+    python_callable=fixed,
+    on_failure_callback=on_failure_callback,
+    dag=dag
+)
+
+transform = PythonOperator(
+    task_id='transform',
+    provide_context=True,
+    python_callable=transform,
+    on_failure_callback=on_failure_callback,
+    dag=dag
+)
+
+sql_generator = PythonOperator(
+    task_id='sql_generator',
+    provide_context=True,
+    python_callable=sql_generator,
+    on_failure_callback=on_failure_callback,
+    dag=dag
+)
+
+apply_sql = PythonOperator(
+    task_id='apply_sql',
+    provide_context=True,
+    python_callable=apply_sql,
+    on_failure_callback=on_failure_callback,
+    dag=dag
+)
+
+
+
+validate_balancing = PythonOperator(
+    task_id='validate_balancing',
+    provide_context=True,
+    python_callable=validate_balancing,
+    on_failure_callback=on_failure_callback,
+    dag=dag
+)
+
+trigger_next_accounting_seat = PythonOperator(
+    task_id='trigger_next_accounting_seat',
+    provide_context=True,
+    python_callable=trigger_next_accounting_seat,
+    on_failure_callback=on_failure_callback,
+    dag=dag
+)
+
+fetch_data >> fixed >> transform >> sql_generator >> apply_sql  >> validate_balancing >> trigger_next_accounting_seat
