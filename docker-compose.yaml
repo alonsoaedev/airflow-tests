@@ -63,15 +63,6 @@ x-airflow-common:
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
 
-    AIRFLOW__EMAIL__EMAIL_BACKEND: 'airflow.utils.email.send_email_smtp'
-    AIRFLOW__SMTP__SMTP_HOST: 'smtp.gmail.com'
-    AIRFLOW__SMTP__SMTP_PORT: '587'
-    AIRFLOW__SMTP__SMTP_USER: 'tesoreria.bbr@gmail.com'
-    AIRFLOW__SMTP__SMTP_PASSWORD: 'hvxmswfgplxuqaqv'
-    AIRFLOW__SMTP__SMTP_MAIL_FROM: 'tesoreria.bbr@gmail.com'
-    # AIRFLOW__EMAIL__SUBJECT_TEMPLATE: '/opt/airflow/dags/repo/dags/email_subject_template.j2'
-    BBR_ENVIRONMENT: 'qa' # dev - qa - prod
-
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     # The following line can be used to set a custom config file, stored in the local config folder
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
